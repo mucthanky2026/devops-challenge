@@ -1,0 +1,62 @@
+name: Backend PR Pipeline
+on:
+  pull_request:
+    branches:
+      - main
+    types: 
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - 'src/backend/**'
+      - 'backend/**'
+
+jobs:
+    check-and-build:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            pull-requests: write
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+            - name: Set up Node.js
+              uses: actions/setup-node@v7
+              with:
+                node-version: '24'
+            - name: Install dependencies
+              run: npm ci
+            - name: Lint
+              run: npx --no-install eslint . --max-warnings=0
+            - name: Unit tests and coverage
+              run: |
+                npx --no-install vitest run
+                --coverage
+                --coverage.reporter=text
+                --coverage.reporter=lcov
+            - name: SonarQube analysis and quality gate
+              env:
+                SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+                SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+                SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+              run: |
+                sonar-scanner \
+                -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                -Dsonar.sources=. \
+                '-Dsonar.exclusions=node_modules/**,.next/**,out/**,dist/**,coverage/**' \
+                -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                -Dsonar.qualitygate.wait=true \
+                -Dsonar.qualitygate.timeout=300
+            - name: Secret scan
+              run: gitleaks git . --redact --exit-code 1
+            - name: Dependency vulnerability scan
+              run: |
+                trivy fs \
+                    --scanners vuln \
+                    --include-dev-deps \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 1 \
+                    .
+            - name: Test build
+              run: npm run build
+            

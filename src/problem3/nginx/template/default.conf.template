@@ -1,0 +1,16 @@
+server {
+    listen ${NGINX_PORT};
+
+    location = / {
+        return 200 "Welcome to the platform\n";
+    }
+
+    location /status {
+        proxy_pass http://${API_NAME}:${API_PORT};
+    }
+
+    location /api/ {
+        proxy_pass http://${API_NAME}:${API_PORT};
+    }
+
+}

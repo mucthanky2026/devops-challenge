@@ -1,0 +1,5 @@
+{
+  "environment": "nprd",
+  "apiBaseUrl": "https://api.nprd.example.com",
+  "wsUrl": "wss://ws.nprd.example.com"
+}

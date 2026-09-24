@@ -1,0 +1,173 @@
+schemaVersion: '2.2'
+description: Deploy a prebuilt Node.js release from S3 using systemd
+
+parameters:
+  artifactBucket:
+    type: String
+    description: S3 bucket containing backend artifacts
+    allowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    default: '12345678910-s3-central-artifacts'
+
+  commit:
+    type: String
+    description: Full Git commit SHA of the release
+    allowedPattern: '^[a-f0-9]{40}$'
+
+  environment:
+    type: String
+    allowedValues:
+      - nprd
+      - prod
+
+  healthCheckUrl:
+    type: String
+    default: 'http://127.0.0.1:3000/health'
+    allowedPattern: '^http://127[.]0[.]0[.]1:[0-9]{1,5}/[a-zA-Z0-9/_-]*$'
+
+mainSteps:
+  - name: DeployBackend
+    action: aws:runShellScript
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '600'
+      runCommand:
+        - |
+          #!/bin/bash
+          set -Eeuo pipefail
+          umask 022
+
+          : "${SSM_artifactBucket:?Missing artifactBucket}"
+          : "${SSM_commit:?Missing commit}"
+          : "${SSM_artifactSha256:?Missing artifactSha256}"
+          : "${SSM_environment:?Missing environment}"
+          : "${SSM_healthCheckUrl:?Missing healthCheckUrl}"
+
+          base="/opt/backend/$SSM_environment"
+          service="backend@$SSM_environment.service"
+
+          for cmd in aws curl flock systemctl sha256sum tar runuser; do
+            command -v "$cmd" >/dev/null
+          done
+
+          id backend >/dev/null
+          mkdir -p "$base/releases"
+
+          # Prevent concurrent deployments on this instance/environment.
+          exec 9>"$base/.deploy.lock"
+          flock -n 9 || {
+            echo "Another deployment is running."
+            exit 1
+          }
+
+          # The service must already be provisioned for this environment.
+          working_dir="$(systemctl show "$service" \
+            --property=WorkingDirectory --value)"
+          if [[ "$working_dir" != "$base/current" ]]; then
+            echo "Unexpected systemd WorkingDirectory: $working_dir"
+            exit 1
+          fi
+
+          if [[ -e "$base/current" && ! -L "$base/current" ]]; then
+            echo "$base/current must be a symlink."
+            exit 1
+          fi
+
+          previous=""
+          if [[ -L "$base/current" ]]; then
+            previous="$(readlink -f "$base/current")"
+            test -d "$previous"
+          fi
+
+          work="$(mktemp -d)"
+          release="$(mktemp -d "$base/releases/$SSM_commit.XXXXXX")"
+          switched=0
+
+          cleanup() {
+            rm -rf -- "$work"
+            rm -f -- "$base/.current-$$"
+          }
+          trap cleanup EXIT
+
+          health_check() {
+            local attempt
+            for attempt in {1..12}; do
+              if systemctl is-active --quiet "$service" &&
+                 curl --fail --silent --show-error \
+                   --connect-timeout 2 --max-time 3 \
+                   "$SSM_healthCheckUrl" >/dev/null; then
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
+
+          switch_release() {
+            ln -s "$1" "$base/.current-$$"
+            mv -Tf "$base/.current-$$" "$base/current"
+          }
+
+          rollback() {
+            local result="$1"
+            trap - ERR
+            set +e
+
+            echo "Deployment failed."
+
+            if [[ "$switched" == 1 ]]; then
+              if [[ -n "$previous" ]]; then
+                echo "Restoring previous release: $previous"
+                if switch_release "$previous" &&
+                   systemctl restart "$service" &&
+                   health_check; then
+                  echo "Rollback succeeded."
+                else
+                  echo "ERROR: Rollback failed; manual recovery required."
+                fi
+              else
+                echo "First deployment failed; stopping service."
+                systemctl stop "$service"
+                rm -f -- "$base/current"
+              fi
+            fi
+
+            # A successful rollback still means this deployment failed.
+            exit "$result"
+          }
+          trap 'rollback "$?"' ERR
+
+          aws s3 cp \
+            "s3://$SSM_artifactBucket/backend/$SSM_commit/app.tar.gz" \
+            "$work/app.tar.gz" \
+            --only-show-errors
+
+          printf '%s  %s\n' \
+            "$SSM_artifactSha256" "$work/app.tar.gz" |
+            sha256sum --check --status
+
+          # Extract as the application user, not root.
+          chmod 755 "$work"
+          chmod 644 "$work/app.tar.gz"
+          chown backend:backend "$release"
+
+          runuser -u backend -- tar \
+            --extract --gzip \
+            --file="$work/app.tar.gz" \
+            --directory="$release" \
+            --no-same-owner \
+            --no-same-permissions
+
+          test -f "$release/package.json"
+          test -f "$release/dist/index.js"
+          test -d "$release/node_modules"
+
+          # Set before switching so failures during activation trigger rollback.
+          switched=1
+          switch_release "$release"
+          systemctl restart "$service"
+          health_check
+
+          echo "Deployment succeeded: $SSM_commit ($SSM_environment)"

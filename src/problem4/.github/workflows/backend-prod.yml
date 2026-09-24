@@ -1,0 +1,152 @@
+name: Backend Prod Pipeline
+
+on:
+  push:
+    tags:
+      - 'backend-v*.*.*'
+
+env:
+  ENV: prod
+
+jobs:
+    validate-release:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Validate release commit
+              run: |
+                if ! git rev-parse --verify ${{ github.sha }} >/dev/null 2>&1; then
+                  echo "Commit ${{ github.sha }} does not exist."
+                  exit 1
+                fi
+                echo "Commit ${{ github.sha }} exists."
+            - name: Authenticate with AWS
+              uses: aws-actions/configure-aws-credentials@v3
+              with:
+                role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+                role-external-id: ${{ secrets.AWS_EXTERNAL_ID }}
+                aws-region: ${{ vars.AWS_REGION }}
+                mask-aws-account-id: true 
+                role-session-name: backend-manual-${{ github.run_id }}
+            - name: Validate release on central artifact
+              run: |
+                aws s3 cp --recursive s3://${{ vars.AWS_S3_ARTIFACT_BUCKET }}/backend/${{ github.sha }}/ out/
+                if [ ! -d "out" ]; then
+                  echo "Release artifact for commit ${{ github.sha }} does not exist in S3."
+                  exit 1
+                fi
+
+                if [ -z "$(ls -A out)" ]; then
+                  echo "Release artifact for commit ${{ github.sha }} is empty in S3."
+                  exit 1
+                fi
+
+                if [ ! -f "out/index.html" ]; then
+                  echo "Release artifact for commit ${{ github.sha }} is missing index.html in S3."
+                  exit 1
+                fi
+
+                echo "Release artifact for commit ${{ github.sha }} exists in S3."
+
+    approval-and-deploy:
+        runs-on: ubuntu-latest
+        needs: validate-release
+        environment:
+            name: ${{ vars.ENV }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+            - name: Authorize AWS
+              uses: aws-actions/configure-aws-credentials@v2
+              with:
+                role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+                aws-region: ${{ vars.AWS_REGION }}
+                role-external-id: ${{ secrets.AWS_EXTERNAL_ID }}
+                mask-aws-account-id: true
+                role-session-name: backend-manual-${{ github.run_id }}
+            - name: Trigger SSM Run Command to deploy backend
+              run: |
+                instance_ids=$(aws ec2 describe-instances \
+                  --filters "Name=tag:Environment,Values=prod" "Name=tag:Service,Values=backend" \
+                  --query "Reservations[*].Instances[*].InstanceId" \
+                  --output text)
+                
+                if [ -z "$instance_ids" ]; then
+                  echo "No backend instances found in prod environment."
+                  exit 1
+                fi
+
+                command_id=$(aws ssm run-command \
+                  --document-name "DeployBackend" \
+                  --parameters "commit=${{ github.sha }},environment=prod" \
+                  --instance_ids $instance_ids \
+                  --region ${{ vars.AWS_REGION }} \
+                  --comment "Deploying backend commit ${{ github.sha }} to prod" \
+                  --timeout-seconds 600 \
+                  --max-concurrency "50" \
+                  --max-errors "0" \
+                  --output text \
+                  --query "Command.CommandId")
+                
+                echo "Deployment command sent. Waiting for completion..."
+                elapsed=0
+                while true; do
+                status=$(aws ssm list-command-invocations \
+                  --command-id $command_id \
+                  --query "CommandInvocations[?InstanceId==$instance_ids].Status" \
+                  --output text)
+                if [ "$status" = "Success" ]; then
+                    echo "Deployment completed successfully."
+                    break
+                fi
+                if [ $elapsed -ge 600 ]; then
+                    echo "Deployment timed out after 10 minutes."
+                    exit 1
+                fi
+                echo "Deployment still in progress... waiting 30 seconds."
+                sleep 30
+                elapsed=$((elapsed + 30))
+                done
+
+    verify:
+        runs-on: ubuntu-latest
+        needs: approval-and-deploy
+        steps:
+            - name: Verify deployment
+              run: |
+                curl -v https://${{ vars.BACKEND_DOMAIN }}/index.html || exit 1
+                curl -v https://${{ vars.BACKEND_DOMAIN }} | grep "200 OK" 
+
+    notify:
+        runs-on: ubuntu-latest
+        needs: [validate-release, approval-and-deploy, verify]
+        steps:
+            - name: Notify Slack
+              uses: slackapi/slack-github-action@v4.0.0
+              with:
+                webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+                webhook-type: incoming-webhook
+                payload: |
+                  {
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": "*Backend Merge Workflow Completed*"
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Commit SHA:*\n${{ github.sha }}"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Workflow Status:*\n${{ job.status }}"
+                          }
+                        ]
+                      }
+                    ]
+                  }
